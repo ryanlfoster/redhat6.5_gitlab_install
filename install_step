@@ -1,0 +1,196 @@
+安装依赖包
+yum install git patch gcc-c++ readline-devel zlib-devel libffi-devel openssl-devel make autoconf automake libtool bison libxml2-devel libxslt-devel libyaml-devel git python python-docutils libicu-devel mysql-devel pcre-devel postfix cmake
+
+安装ruby
+mdir /tmp/ruby 
+cd  /tmp/ruby
+curl --progress ftp://ftp.ruby-lang.org/pub/ruby/2.0/ruby-2.0.0-p353.tar.gz | tar xz
+cd /tmp/ruby/ruby-2.0.0-p353
+
+./configure --prefix=/usr/local/
+make -j 12 && make install
+
+安装git2.0：
+cd /tmp
+curl --progress https://www.kernel.org/pub/software/scm/git/git-2.0.0.tar.gz | tar xz
+cd git-2.0.0/
+make prefix=/usr/local all
+
+安装bundle： 
+安装前更换为淘宝源  否则时间很长
+gem install bundler --no-ri --no-rdoc
+
+gem sources -a https://ruby.taobao.org  添加淘宝源
+删除之前自带的
+gem sources -r https://rubygems.org/
+
+显示当前使用的sources     gem sources 
+添加一个source    gem sources -a url地址 
+删除一个source   gem sources -r url地址 
+更新source cache     gem sources -u 
+
+#安装gitlab
+创建git用户  家目录指定在数据存储分区，git仓库不能做软连接，否则启动服务后下载代码报错，
+安装gitlab
+su - git
+git clone https://gitlab.com/gitlab-org/gitlab-ce.git  gitlab   下载gitlanb代码
+git checkout 7-0-stable 
+修改gitlab下 Gemfile 文件中的第一行  将sources改为 https://ruby.taobao.org 
+
+修改配置文件中的访问域名
+（your_domain_name为项目的访问域名或者IP）
+$ sed  -i  's|localhost|your_domain_name|g'   config/gitlab.yml  设置工作路径  必须设置正确 否则下面数据库初始化的时候报错
+
+# 设定log和tmp目录所有者和权限
+$ chown -R git log/
+$ chown -R git tmp/
+$ chmod -R u+rwX log/
+$ chmod -R u+rwX tmp/
+
+# 创建gitlab-satellites目录
+$ mkdir /home/git/gitlab-satellites
+chmod u+rwx,g=rx,o-rwx /opt/git/gitlab-satellites
+
+# 修改gitlab目录下权限，确保gitlab有相应的权限
+$ chmod -R u+rwX tmp/pids/
+$ chmod -R u+rwX tmp/sockets/
+$ chmod -R u+rwX public/uploads 
+
+#拷贝配置文件
+$ cp config/unicorn.rb.example config/unicorn.rb  ruby进程配置文件  设置工作目录 以及日志路径 开启的进程数
+$ cp config/database.yml.mysql config/database.yml  数据库配置文件   设置账号密码  链接方式
+$ chmod o-rwx config/database.yml
+
+配置GitLab shell
+GitLab shell是专门为GitLab开发的提供ssh访问和版本管理的软件。
+ 
+$ su - git
+克隆gitlab shell
+$ git clone https://github.com/gitlabhq/gitlab-shell.git
+$ cd gitlab-shell
+切换成1.9.6版本，并编辑配置
+
+$ git checkout v1.9.6
+$ cp config.yml.example config.yml
+
+$ 配置完后执行  ./bin/install
+这里最重要的是将gitlab_url修改成gitlab的访问域名。形如：http://test.gitlab.com/  配置和 gitlab.yml 文件一致
+配置文件内容如下：
+gitlab_url: http://127.0.0.1:8080/
+http_settings:
+  self_signed_cert: false
+repos_path: /opt/git/repositories/  #仓库路径
+auth_file: /opt/git/.ssh/authorized_keys #key文件目录
+redis:
+  bin: /usr/bin/redis-cli  #redis文件路径
+  host: localhost   #地址 
+  port: 6379
+  namespace: resque:gitlab
+log_level: INFO
+audit_usernames: false
+
+
+#安装数据库支持
+bundle install --deployment --without development test postgres aws  命令在gitlab目录下执行
+
+在mysql中创建 gitlab用户
+create user 'git'@'%' identified by 'gitlab';
+
+创建数据库
+CREATE DATABASE IF NOT EXISTS `gitlabhq_production` DEFAULT CHARACTER SET `utf8` COLLATE `utf8_unicode_ci`;
+
+给gitlab账户设置权限
+GRANT SELECT, LOCK TABLES, INSERT, UPDATE, DELETE, CREATE, DROP, INDEX, ALTER ON `gitlabhq_production`.* TO 'git'@'localhost';
+
+初始化数据和激活高级功能
+$ mkdir /opt/git/repositories   创建仓库
+$ cd /opt/git/gitlab
+$ bundle exec rake gitlab:setup RAILS_ENV=production
+这步完成后，会生一个默认的管理员账号：
+admin@local.host
+5iveL!fe
+
+$ bundle exec rake assets:precompile RAILS_ENV=production  #生成后台文件和图片
+
+拷贝启动文件 
+cp /opt/git/gitlab/lib/support/init.d/gitlab /etc/init.d/
+chmod +x /etc/init.d.gitlab
+/etc/init.d/gitlab start
+
+安装nginx并拷贝配置文件  根据自身配置修改
+cp /opt/git/gitlab/lib/support/nginx/gitlab   /opt/nginx/conf/extra/gitlab.conf
+ 内容如下：
+upstream gitlab {
+  server unix:/opt/git/gitlab/tmp/sockets/gitlab.socket;
+}
+
+server {
+  listen 80;         # e.g., listen 192.168.1.1:80; In most cases *:80 is a good idea
+  server_name 10.10.22.99;     # e.g., server_name source.example.com;
+  server_tokens off;     # don't show the version number, a security best practice
+  root /opt/git/gitlab/public;
+  
+  client_max_body_size 20m;
+
+  access_log  logs/gitlab_access.log;
+  error_log   logs/gitlab_error.log;
+
+  location / {
+    try_files $uri $uri/index.html $uri.html @gitlab;
+  }
+
+  location @gitlab {
+
+    proxy_read_timeout 600; # Some requests take more than 30 seconds.
+    proxy_connect_timeout 600; # Some requests take more than 30 seconds.
+    proxy_redirect     off;
+
+    proxy_set_header   X-Forwarded-Proto $scheme;
+    proxy_set_header   Host              $http_host;
+    proxy_set_header   X-Real-IP         $remote_addr;
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Frame-Options   SAMEORIGIN;
+
+    proxy_pass http://gitlab;
+  }
+
+  location ~ ^/(assets)/  {
+    root /opt/git/gitlab/public;
+    gzip_static on; # to serve pre-gzipped version
+    expires max;
+    add_header Cache-Control public;
+  }
+
+  error_page 502 /502.html;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
